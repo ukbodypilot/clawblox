@@ -97,6 +97,7 @@ const chatState = {
   sessionToken: null,
   agentId: null,
   playerName: null,
+  spectatorChat: false,
 }
 let selectedSpectatorPlayerId = null
 let latestSpectatorState = null
@@ -1758,10 +1759,17 @@ function makeLocalPlayerName() {
 }
 
 async function ensureChatSession() {
-  if (chatState.sessionToken) return
+  if (chatState.sessionToken || chatState.spectatorChat) return
   const playerName = chatState.playerName || makeLocalPlayerName()
   chatState.playerName = playerName
   const resp = await fetch(withBasePath(`/join?name=${encodeURIComponent(playerName)}`), { method: 'POST' })
+  if (resp.status === 400) {
+    // The world refused a new player (usually full because the agent holds the
+    // only slot). Chat as a spectator instead, which needs no player slot.
+    chatState.spectatorChat = true
+    setChatLocalStatus(`Chatting as ${playerName} (spectator)`)
+    return
+  }
   if (!resp.ok) throw new Error(`join failed: HTTP ${resp.status}`)
   const data = await resp.json()
   chatState.sessionToken = data.session || null
@@ -1876,17 +1884,23 @@ async function sendChatMessage(text) {
   updateChatSendUi()
   try {
     await ensureChatSession()
-    const resp = await fetch(withBasePath('/chat'), {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Session': chatState.sessionToken,
-      },
-      body: JSON.stringify({ content }),
-    })
+    const resp = chatState.spectatorChat
+      ? await fetch(withSpectatorToken('/spectate/chat'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: chatState.playerName, content }),
+      })
+      : await fetch(withBasePath('/chat'), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Session': chatState.sessionToken,
+        },
+        body: JSON.stringify({ content }),
+      })
     if (!resp.ok) throw new Error(`chat send failed: HTTP ${resp.status}`)
     if (chatInputEl) chatInputEl.value = ''
-    setChatLocalStatus(`Chatting as ${chatState.playerName}`)
+    setChatLocalStatus(`Chatting as ${chatState.playerName}${chatState.spectatorChat ? ' (spectator)' : ''}`)
   } catch (err) {
     console.error(err)
     setChatLocalStatus(err instanceof Error ? err.message : 'Failed to send chat')
