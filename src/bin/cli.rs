@@ -2580,6 +2580,7 @@ fn run_game(
             .route("/ui/{*path}", get(local_ui_file))
             .route("/spectate", get(local_spectate))
             .route("/spectate/ws", get(local_spectate_ws))
+            .route("/spectate/chat", post(local_spectate_chat))
             .route("/spectate/chat/messages", get(local_spectate_chat_messages))
             .route("/renderer/manifest", get(local_renderer_manifest))
             .route("/replay/info", get(live_replay_info_probe))
@@ -5502,6 +5503,15 @@ async fn local_chat(
         )
     };
 
+    broadcast_and_record_chat(&state, &msg);
+
+    Ok(Json(ChatPostResponse {
+        id: msg.id,
+        created_at: msg.created_at,
+    }))
+}
+
+fn broadcast_and_record_chat(state: &LocalState, msg: &LocalChatMessage) {
     let _ = state.chat_tx.send(msg.clone());
 
     // Record chat message if recording is enabled
@@ -5511,8 +5521,9 @@ async fn local_chat(
             game::get_spectator_observation_for_instance(&state.game_handle, state.instance_id)
                 .map(|obs| obs.tick)
                 .unwrap_or(0);
-        let recording_tick = remap_recording_tick(&state, source_tick);
+        let recording_tick = remap_recording_tick(state, source_tick);
         let writer = writer.clone();
+        let agent_id = msg.agent_id;
         let msg_id = msg.id.clone();
         let agent_name_clone = msg.agent_name.clone();
         let content_clone = msg.content.clone();
@@ -5552,6 +5563,85 @@ async fn local_chat(
             .await;
         });
     }
+}
+
+#[derive(Deserialize)]
+struct SpectatorChatRequest {
+    name: String,
+    content: String,
+}
+
+/// Lets a spectator (the browser viewer) talk into the world without joining
+/// as a player. Worlds with a small `max_players` are often full once the agent
+/// is in, which made the viewer's chat fail with "Instance is full". Spectator
+/// messages are heard by every player, whatever the speech mode, since the
+/// spectator has no position in the world.
+async fn local_spectate_chat(
+    State(state): State<LocalState>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<ChatMessagesQuery>,
+    Json(body): Json<SpectatorChatRequest>,
+) -> Result<Json<ChatPostResponse>, (axum::http::StatusCode, String)> {
+    if let Some(err) = check_halted(&state) {
+        return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, err));
+    }
+    require_spectator_access(
+        &state.spectator_token,
+        &headers,
+        query.spectator_token.as_deref(),
+    )?;
+
+    let name = body.name.trim();
+    if name.is_empty() || name.chars().count() > 40 {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "name must be 1-40 non-whitespace characters".to_string(),
+        ));
+    }
+    let content = body.content.trim();
+    if content.is_empty() {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "content must be 1-500 non-whitespace characters".to_string(),
+        ));
+    }
+    if content.chars().count() > 500 {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "content exceeds 500 characters".to_string(),
+        ));
+    }
+
+    let observation =
+        game::get_spectator_observation_for_instance(&state.game_handle, state.instance_id)
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let heard_by = observation.players.iter().map(|p| p.id).collect::<Vec<_>>();
+    let audibility = observation
+        .players
+        .iter()
+        .map(|p| ChatAudibilityEntry {
+            agent_id: p.id,
+            agent_name: p.name.clone(),
+            distance: None,
+            heard: true,
+        })
+        .collect::<Vec<_>>();
+
+    let msg = {
+        let mut chat = state.chat_state.lock().unwrap();
+        chat.push(
+            state.instance_id,
+            Uuid::nil(),
+            name.to_string(),
+            content.to_string(),
+            "spectator".to_string(),
+            None,
+            heard_by,
+            audibility,
+        )
+    };
+
+    broadcast_and_record_chat(&state, &msg);
 
     Ok(Json(ChatPostResponse {
         id: msg.id,
