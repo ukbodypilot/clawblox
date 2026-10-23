@@ -186,6 +186,72 @@ impl ClaudePlan {
     }
 }
 
+/// Writes the live pacing override that the agent's pace hook re-reads before
+/// every model request, so budgets change without restarting the agent.
+fn update_agent_pace(
+    agent_dir: &std::path::Path,
+    rate_limits: Vec<String>,
+    min_request_interval: Option<f64>,
+    burst: Option<bool>,
+    reset: bool,
+) {
+    let runtime_dir = agent_dir.join("runtime");
+    if !runtime_dir.is_dir() {
+        eprintln!(
+            "Error: {} is not an agent directory (no runtime/ folder)",
+            agent_dir.display()
+        );
+        std::process::exit(2);
+    }
+    let path = runtime_dir.join("pace.json");
+    if reset {
+        let _ = std::fs::remove_file(&path);
+        println!(
+            "Removed {}; the agent is back to its startup budget.",
+            path.display()
+        );
+        return;
+    }
+    let mut config: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    let changed = !rate_limits.is_empty() || min_request_interval.is_some() || burst.is_some();
+    if !rate_limits.is_empty() {
+        config.insert("rate_limits".into(), rate_limits.into());
+    }
+    if let Some(seconds) = min_request_interval {
+        config.insert("min_interval_seconds".into(), seconds.into());
+    }
+    if let Some(burst) = burst {
+        config.insert("pace".into(), if burst { "burst" } else { "even" }.into());
+    }
+    if changed {
+        let text = serde_json::to_string_pretty(&config).unwrap_or_default();
+        if let Err(err) = std::fs::write(&path, format!("{text}\n")) {
+            eprintln!("Error: failed to write {}: {err}", path.display());
+            std::process::exit(1);
+        }
+        println!(
+            "Updated {}; the agent picks it up within a few seconds.",
+            path.display()
+        );
+    }
+    if config.is_empty() {
+        println!("No live override; the agent uses the budget it started with.");
+    } else {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&config).unwrap_or_default()
+        );
+    }
+    if let Ok(log) = std::fs::read_to_string(agent_dir.join("logs").join("pace.log")) {
+        if let Some(last) = log.lines().last() {
+            println!("Last pace.log entry: {last}");
+        }
+    }
+}
+
 fn parse_rate_limit_arg(text: &str) -> Result<String, String> {
     clawblox::agent_runner::parse_rate_limit(text)?;
     Ok(text.trim().to_string())
@@ -233,9 +299,13 @@ enum Commands {
         /// Datastore backend for local DataStoreService
         #[arg(long, value_enum, default_value_t = LocalDatastore::Sqlite)]
         datastore: LocalDatastore,
-        /// Record session to a .clawrec file for later replay
+        /// Record session to a .clawrec file for later replay (on by default
+        /// when --agent is set)
         #[arg(long, env = "WORLD_RECORD")]
         record: bool,
+        /// Don't record, even when --agent is set
+        #[arg(long, conflicts_with = "record")]
+        no_record: bool,
         /// Directory to write recording output into (default: <world>/recordings)
         #[arg(long, env = "CLAWBLOX_RECORD_DIR")]
         record_dir: Option<PathBuf>,
@@ -285,6 +355,28 @@ enum Commands {
         /// requests evenly across it
         #[arg(long)]
         burst: bool,
+    },
+    /// Show or change a running Claude agent's request budget without
+    /// restarting it (writes <agent-dir>/runtime/pace.json)
+    Pace {
+        /// The agent's directory (default for `clawblox run`:
+        /// <world>/.clawblox/agents/<name>)
+        agent_dir: PathBuf,
+        /// New request budget like 300/5h or 4500/week (repeatable)
+        #[arg(long = "rate-limit", value_parser = parse_rate_limit_arg)]
+        rate_limits: Vec<String>,
+        /// New minimum seconds between model requests
+        #[arg(long)]
+        min_request_interval: Option<f64>,
+        /// Spend each window as fast as allowed
+        #[arg(long, conflicts_with = "even")]
+        burst: bool,
+        /// Spread requests evenly across each window
+        #[arg(long)]
+        even: bool,
+        /// Remove pace.json and go back to the budget the agent started with
+        #[arg(long, conflicts_with_all = ["rate_limits", "min_request_interval", "burst", "even"])]
+        reset: bool,
     },
     /// Replay a recorded session
     Replay {
@@ -393,6 +485,7 @@ fn main() {
             daemon,
             datastore,
             record,
+            no_record,
             record_dir,
             resume,
             skip_run_command,
@@ -431,6 +524,7 @@ fn main() {
                     pacing.even_interval_seconds()
                 );
             }
+            let record = record || (agent.is_some() && !no_record);
             let model = model
                 .or_else(|| matches!(plan, Some(ClaudePlan::Pro)).then(|| "sonnet".to_string()));
             run_game(
@@ -457,6 +551,20 @@ fn main() {
                 }),
             )
         }
+        Commands::Pace {
+            agent_dir,
+            rate_limits,
+            min_request_interval,
+            burst,
+            even,
+            reset,
+        } => update_agent_pace(
+            &agent_dir,
+            rate_limits,
+            min_request_interval,
+            burst.then_some(true).or(even.then_some(false)),
+            reset,
+        ),
         Commands::Replay {
             file,
             speed,

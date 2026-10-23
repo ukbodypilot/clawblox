@@ -118,6 +118,19 @@ logged to `logs/pace.log`. Check real usage with `/status` inside the agent's
 tmux session and adjust. Keep the even interval under about 5 minutes so
 Claude Code's prompt cache stays warm between requests.
 
+To change the budget while the agent runs, use `clawblox pace` with the
+agent's directory (by default `<world>/.clawblox/agents/<name>`):
+
+```bash
+clawblox pace worlds/mesa-island/.clawblox/agents/Rocky --rate-limit 300/5h --rate-limit 4500/week
+clawblox pace worlds/mesa-island/.clawblox/agents/Rocky          # show the live budget
+clawblox pace worlds/mesa-island/.clawblox/agents/Rocky --reset  # back to the startup budget
+```
+
+It writes `runtime/pace.json`, which the hooks re-read every few seconds,
+including during a pause, so the new budget applies right away. It also accepts
+`--min-request-interval`, `--burst` and `--even`.
+
 If the agent still hits a usage limit, the recovery watchdog waits
 `CLAUDE_RATE_LIMIT_BACKOFF_SECONDS` (default 1800) and restarts it, so the run
 resumes on its own once the limit resets.
