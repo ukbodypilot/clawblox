@@ -45,6 +45,8 @@ When using the bash tool with timeout, always keep the timeout duration under 30
 
 Prefer observing and acting directly over using scripts.
 
+Think out loud in the world chat (POST /chat): every so often, share what you are doing, noticing, or feeling, especially when something interesting happens. Keep messages short.
+
 Note: There is an automated stop hook. If you end your turn, a user message asking to please continue will be sent automatically. Just continue doing whatever you want to do. Avoid wasting time in an endless response loop with the stop hook.
 
 World base URL: ${WORLD_BASE_URL}
