@@ -18,6 +18,9 @@ pub struct AgentRecoveryConfig {
     pub idle_grace_seconds: u64,
     pub stall_grace_seconds: u64,
     pub restart_backoff_seconds: u64,
+    /// After a usage-limit failure, wait this long before restarting instead of
+    /// restarting straight into the same limit.
+    pub rate_limit_backoff_seconds: u64,
     pub poll_seconds: u64,
 }
 
@@ -30,6 +33,7 @@ struct AgentRecoveryMetadata {
     idle_grace_seconds: u64,
     stall_grace_seconds: u64,
     restart_backoff_seconds: u64,
+    rate_limit_backoff_seconds: u64,
     poll_seconds: u64,
 }
 
@@ -45,6 +49,7 @@ pub fn start_agent_recovery_watchdog(config: AgentRecoveryConfig) -> Result<(), 
         idle_grace_seconds: config.idle_grace_seconds,
         stall_grace_seconds: config.stall_grace_seconds,
         restart_backoff_seconds: config.restart_backoff_seconds,
+        rate_limit_backoff_seconds: config.rate_limit_backoff_seconds,
         poll_seconds: config.poll_seconds,
     };
     let metadata_path = runtime_dir.join("recovery_watchdog.json");
@@ -65,12 +70,13 @@ fn watch_recovery(config: AgentRecoveryConfig) {
         &config,
         "watch_start",
         &format!(
-            "agent_dir={} command_file={} idle_grace_seconds={} stall_grace_seconds={} restart_backoff_seconds={} poll_seconds={}",
+            "agent_dir={} command_file={} idle_grace_seconds={} stall_grace_seconds={} restart_backoff_seconds={} rate_limit_backoff_seconds={} poll_seconds={}",
             config.agent_dir.display(),
             config.command_file.display(),
             config.idle_grace_seconds,
             config.stall_grace_seconds,
             config.restart_backoff_seconds,
+            config.rate_limit_backoff_seconds,
             config.poll_seconds,
         ),
     );
@@ -131,6 +137,29 @@ fn watch_recovery(config: AgentRecoveryConfig) {
         }
         let now = now_epoch();
 
+        if is_rate_limit_error(&failure_error) {
+            if now.saturating_sub(stop_failure_epoch) < config.rate_limit_backoff_seconds {
+                sleep_poll(&config);
+                continue;
+            }
+            last_handled_key = current_key;
+            log_event(
+                &config,
+                "recover_rate_limit",
+                &format!(
+                    "session_id={session_id} error={failure_error} stop_failure_epoch={stop_failure_epoch} backoff_seconds={}",
+                    config.rate_limit_backoff_seconds
+                ),
+            );
+            respawn_agent(
+                &config,
+                "stop_failure_rate_limit",
+                &session_id,
+                stop_failure_epoch,
+            );
+            continue;
+        }
+
         if session_end_epoch >= stop_failure_epoch {
             last_handled_key = current_key;
             log_event(
@@ -190,6 +219,11 @@ fn watch_recovery(config: AgentRecoveryConfig) {
         sleep_poll(&config);
     }
     log_event(&config, "watch_exit", "reason=pane_missing");
+}
+
+fn is_rate_limit_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("rate_limit") || error.contains("usage_limit")
 }
 
 fn current_session_id(config: &AgentRecoveryConfig) -> Option<String> {
@@ -390,6 +424,7 @@ mod tests {
             idle_grace_seconds: 1,
             stall_grace_seconds: 1,
             restart_backoff_seconds: 1,
+            rate_limit_backoff_seconds: 1,
             poll_seconds: 1,
         };
 
@@ -399,5 +434,13 @@ mod tests {
                 "/tmp/agent/sandbox-home/.claude/transcript.jsonl"
             ))
         );
+    }
+
+    #[test]
+    fn detects_usage_limit_failures() {
+        assert!(is_rate_limit_error("rate_limit"));
+        assert!(is_rate_limit_error("RATE_LIMIT"));
+        assert!(!is_rate_limit_error("server_error"));
+        assert!(!is_rate_limit_error("unknown"));
     }
 }

@@ -350,14 +350,10 @@ impl Agent for ClaudeAgent {
             &bin_dir.join("user_prompt_submit.sh"),
             "#!/usr/bin/env bash\nexit 0\n",
         )?;
-        write_executable_file(
-            &bin_dir.join("stop_failure.sh"),
-            "#!/usr/bin/env bash\nexit 0\n",
-        )?;
-        write_executable_file(
-            &bin_dir.join("notification.sh"),
-            "#!/usr/bin/env bash\nexit 0\n",
-        )?;
+        write_executable_file(&bin_dir.join("pre_tool_use.sh"), CLAUDE_PRE_TOOL_USE_SH)?;
+        write_executable_file(&bin_dir.join("pace.js"), CLAUDE_PACE_JS)?;
+        write_executable_file(&bin_dir.join("stop_failure.sh"), CLAUDE_STOP_FAILURE_SH)?;
+        write_executable_file(&bin_dir.join("notification.sh"), CLAUDE_NOTIFICATION_SH)?;
         if let Some(layout) = &ctx.sandbox {
             prepare_claude_sandbox_home(ctx, layout)?;
             write_claude_sandbox_settings(ctx)?;
@@ -400,6 +396,9 @@ impl Agent for ClaudeAgent {
                 "CLAUDE_AUTO_LOOP_MESSAGE".to_string(),
                 "CLAUDE_CODE_STOP_HOOK_BLOCK_CAP".to_string(),
                 "CLAWBLOX_CLAUDE_RUNTIME_DIR".to_string(),
+                "CLAWBLOX_CLAUDE_RATE_LIMITS".to_string(),
+                "CLAWBLOX_CLAUDE_MIN_INTERVAL".to_string(),
+                "CLAWBLOX_CLAUDE_PACE".to_string(),
                 "WORLD_INTERNAL_BASE_URL".to_string(),
             ],
             needs_network: ctx.settings.sandbox_enabled,
@@ -1938,12 +1937,24 @@ const CLAUDE_HOOKS_JSON: &str = r#"{
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/pre_tool_use.sh\"",
+            "timeout": 604800
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/stop.sh\""
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/stop.sh\"",
+            "timeout": 604800
           }
         ]
       }
@@ -2046,8 +2057,260 @@ if [[ -z "$auto_loop_message" ]]; then
 fi
 
 if [[ "${CLAWBLOX_CLAUDE_AUTO_LOOP:-0}" == "1" ]]; then
+  if [[ -n "${CLAWBLOX_CLAUDE_RATE_LIMITS:-}${CLAWBLOX_CLAUDE_MIN_INTERVAL:-}" || -f "${CLAWBLOX_CLAUDE_RUNTIME_DIR:-/nonexistent}/pace.json" ]]; then
+    printf '%s' "$input" | node "$(dirname "$0")/pace.js" stop || true
+  fi
   CLAUDE_AUTO_LOOP_MESSAGE="$auto_loop_message" node -e 'process.stdout.write(JSON.stringify({ decision: "block", reason: process.env.CLAUDE_AUTO_LOOP_MESSAGE }))'
 fi
+"#;
+
+const CLAUDE_PRE_TOOL_USE_SH: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+
+# Each tool call means a model request just finished; pace the next one.
+if [[ "${CLAWBLOX_CLAUDE_AUTO_LOOP:-0}" == "1" ]] && [[ -n "${CLAWBLOX_CLAUDE_RATE_LIMITS:-}${CLAWBLOX_CLAUDE_MIN_INTERVAL:-}" || -f "${CLAWBLOX_CLAUDE_RUNTIME_DIR:-/nonexistent}/pace.json" ]]; then
+  node "$(dirname "$0")/pace.js" pre_tool_use || true
+fi
+exit 0
+"#;
+
+const CLAUDE_STOP_FAILURE_SH: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+
+input="$(cat)"
+log_dir="${CLAWBLOX_CLAUDE_LOG_DIR:-}"
+session_id="$(INPUT_JSON="$input" node -e 'var data = JSON.parse(process.env.INPUT_JSON || "{}"); process.stdout.write(String(data.session_id || ""));')"
+
+# The recovery watchdog reads these files to restart the agent after an API
+# failure such as a usage limit.
+if [[ -n "$log_dir" ]]; then
+  mkdir -p "$log_dir"
+  printf '%s\n' "$input" >"$log_dir/stop_failure.json"
+  if [[ -n "$session_id" ]]; then
+    printf '%s\n' "$input" >"$log_dir/stop_failure.${session_id}.json"
+  fi
+fi
+exit 0
+"#;
+
+const CLAUDE_NOTIFICATION_SH: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+
+input="$(cat)"
+log_dir="${CLAWBLOX_CLAUDE_LOG_DIR:-}"
+session_id="$(INPUT_JSON="$input" node -e 'var data = JSON.parse(process.env.INPUT_JSON || "{}"); process.stdout.write(String(data.session_id || ""));')"
+notification_type="$(INPUT_JSON="$input" node -e 'var data = JSON.parse(process.env.INPUT_JSON || "{}"); process.stdout.write(String(data.notification_type || ""));')"
+
+if [[ -n "$log_dir" ]]; then
+  mkdir -p "$log_dir"
+  printf '%s\n' "$input" >"$log_dir/notification.json"
+  if [[ -n "$notification_type" ]]; then
+    printf '%s\n' "$input" >"$log_dir/notification.${notification_type}.json"
+    if [[ -n "$session_id" ]]; then
+      printf '%s\n' "$input" >"$log_dir/notification.${notification_type}.${session_id}.json"
+    fi
+  elif [[ -n "$session_id" ]]; then
+    printf '%s\n' "$input" >"$log_dir/notification.${session_id}.json"
+  fi
+fi
+exit 0
+"#;
+
+/// Request pacer shared by the PreToolUse and Stop hooks. Every hook call
+/// marks one finished model response; the pacer sleeps until the next model
+/// request fits every `CLAWBLOX_CLAUDE_RATE_LIMITS` window (e.g. "250/5h,3000/week").
+/// With `CLAWBLOX_CLAUDE_PACE=even` (the default) requests are also spread
+/// evenly across each window instead of being spent in a burst.
+const CLAUDE_PACE_JS: &str = r#"#!/usr/bin/env node
+"use strict";
+const fs = require("fs");
+const path = require("path");
+
+const PERIODS = { s: 1, sec: 1, m: 60, min: 60, h: 3600, hour: 3600, d: 86400, day: 86400, w: 604800, week: 604800 };
+
+function parseLimits(text) {
+  const limits = [];
+  for (const part of String(text || "").split(",")) {
+    const item = part.trim().toLowerCase();
+    if (!item) continue;
+    const m = /^(\d+)\s*\/\s*(\d*\.?\d*)\s*([a-z]+)$/.exec(item);
+    if (!m || !PERIODS[m[3]] || Number(m[1]) <= 0) {
+      process.stderr.write(`clawblox pace: ignoring bad limit ${JSON.stringify(part)}\n`);
+      continue;
+    }
+    limits.push({ count: Number(m[1]), seconds: (m[2] ? Number(m[2]) : 1) * PERIODS[m[3]], label: item });
+  }
+  return limits;
+}
+
+function readStdin() {
+  try {
+    return fs.readFileSync(0, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+// Id of the newest assistant message, so parallel tool calls from one model
+// response are paced once rather than once per tool.
+function lastAssistantId(transcriptPath) {
+  if (!transcriptPath) return "";
+  try {
+    const fd = fs.openSync(transcriptPath, "r");
+    const size = fs.fstatSync(fd).size;
+    const len = Math.min(size, 256 * 1024);
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, size - len);
+    fs.closeSync(fd);
+    const lines = buf.toString("utf8").split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (!lines[i].includes('"assistant"')) continue;
+      try {
+        const entry = JSON.parse(lines[i]);
+        if (entry.type === "assistant" && entry.message && entry.message.id) return String(entry.message.id);
+      } catch {}
+    }
+  } catch {}
+  return "";
+}
+
+function withLock(lockFile, fn) {
+  const deadline = Date.now() + 30000;
+  for (;;) {
+    try {
+      fs.writeFileSync(lockFile, String(process.pid), { flag: "wx" });
+      break;
+    } catch {
+      try {
+        if (Date.now() - fs.statSync(lockFile).mtimeMs > 30000) fs.unlinkSync(lockFile);
+      } catch {}
+      if (Date.now() > deadline) break;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    try {
+      fs.unlinkSync(lockFile);
+    } catch {}
+  }
+}
+
+// `clawblox pace <agent-dir>` writes runtime/pace.json; it is re-read before
+// every request and overrides the startup budget field by field.
+function readOverride(runtimeDir) {
+  try {
+    const data = JSON.parse(fs.readFileSync(path.join(runtimeDir, "pace.json"), "utf8"));
+    return data && typeof data === "object" ? data : {};
+  } catch {
+    return {};
+  }
+}
+
+function loadConfig(runtimeDir) {
+  const override = readOverride(runtimeDir);
+  const limits = parseLimits(
+    Array.isArray(override.rate_limits) ? override.rate_limits.join(",") : process.env.CLAWBLOX_CLAUDE_RATE_LIMITS
+  );
+  const minInterval = Math.max(
+    0,
+    Number(override.min_interval_seconds ?? process.env.CLAWBLOX_CLAUDE_MIN_INTERVAL ?? 0) || 0
+  );
+  const even = String(override.pace || process.env.CLAWBLOX_CLAUDE_PACE || "even").toLowerCase() !== "burst";
+  let interval = minInterval;
+  if (even) for (const l of limits) interval = Math.max(interval, l.seconds / l.count);
+  const horizon = Math.max(interval, ...limits.map((l) => l.seconds));
+  return { limits, interval, horizon, enabled: limits.length > 0 || minInterval > 0 };
+}
+
+function mtime(file) {
+  try {
+    return fs.statSync(file).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+function sleepSeconds(seconds) {
+  if (seconds > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.ceil(seconds * 1000));
+}
+
+// Reserves the next request slot. `replace` is a slot this hook reserved
+// earlier and is re-planning because the budget changed while it slept.
+function schedule(stateFile, config, messageId, replace) {
+  return withLock(stateFile + ".lock", () => {
+    let state = { requests: [], last_message_id: "" };
+    try {
+      state = Object.assign(state, JSON.parse(fs.readFileSync(stateFile, "utf8")));
+    } catch {}
+    if (replace === undefined && messageId && messageId === state.last_message_id) return null;
+
+    const now = Date.now() / 1000;
+    let requests = state.requests.filter((t) => t > now - config.horizon && t !== replace).sort((a, b) => a - b);
+    let at = now;
+    if (requests.length) at = Math.max(at, requests[requests.length - 1] + config.interval);
+    for (const l of config.limits) {
+      const inWindow = requests.filter((t) => t > at - l.seconds);
+      if (inWindow.length >= l.count) at = Math.max(at, inWindow[inWindow.length - l.count] + l.seconds);
+    }
+    requests.push(at);
+    state.requests = requests;
+    state.last_message_id = messageId || state.last_message_id;
+    fs.writeFileSync(stateFile, JSON.stringify(state));
+    const usage = config.limits
+      .map((l) => `${requests.filter((t) => t > at - l.seconds).length}/${l.label}`)
+      .join(" ");
+    return { at, wait: at - now, usage };
+  });
+}
+
+function main() {
+  const source = process.argv[2] || "hook";
+  const runtimeDir = process.env.CLAWBLOX_CLAUDE_RUNTIME_DIR || process.cwd();
+  const overrideFile = path.join(runtimeDir, "pace.json");
+  let config = loadConfig(runtimeDir);
+  if (!config.enabled) return;
+
+  let input = {};
+  try {
+    input = JSON.parse(readStdin() || "{}");
+  } catch {}
+  const logDir = process.env.CLAWBLOX_CLAUDE_LOG_DIR || runtimeDir;
+  fs.mkdirSync(runtimeDir, { recursive: true });
+  const stateFile = path.join(runtimeDir, "pace_state.json");
+  const messageId = lastAssistantId(input.transcript_path);
+  const log = (label, plan) => {
+    const line = `${new Date().toISOString()} ${label} wait=${plan.wait.toFixed(1)}s ${plan.usage}\n`;
+    try {
+      fs.mkdirSync(logDir, { recursive: true });
+      fs.appendFileSync(path.join(logDir, "pace.log"), line);
+    } catch {}
+  };
+
+  let plan = schedule(stateFile, config, messageId);
+  if (!plan) return;
+  log(source, plan);
+
+  // Sleep in short steps so a budget changed with `clawblox pace` applies to
+  // this wait too, not only to the next request.
+  let seenMtime = mtime(overrideFile);
+  for (;;) {
+    const remaining = plan.at - Date.now() / 1000;
+    if (remaining <= 0) return;
+    sleepSeconds(Math.min(remaining, 5));
+    const current = mtime(overrideFile);
+    if (current !== seenMtime) {
+      seenMtime = current;
+      config = loadConfig(runtimeDir);
+      if (!config.enabled) return;
+      plan = schedule(stateFile, config, messageId, plan.at);
+      log(`${source}:replanned`, plan);
+    }
+  }
+}
+
+main();
 "#;
 
 const CLAUDE_POST_TOOL_USE_CHAT_PY: &str = r#"#!/usr/bin/env python3
@@ -2969,6 +3232,131 @@ mod tests {
     /// back to the intuitive exit-2 block, the loop silently dies on Kimi (the
     /// runtime caps the hook at one continuation per turn), so this test fails
     /// loudly instead.
+    #[test]
+    fn claude_pace_hook_spreads_requests_and_dedupes_parallel_tools() {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: node not available");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "clawblox-claude-pace-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hook = dir.join("pace.js");
+        write_executable_file(&hook, CLAUDE_PACE_JS).unwrap();
+        let transcript = dir.join("transcript.jsonl");
+
+        let run = |message_id: &str| {
+            use std::io::Write;
+            std::fs::write(
+                &transcript,
+                format!("{{\"type\":\"assistant\",\"message\":{{\"id\":\"{message_id}\"}}}}\n"),
+            )
+            .unwrap();
+            let started = std::time::Instant::now();
+            let mut child = std::process::Command::new("node")
+                .arg(&hook)
+                .arg("test")
+                .env("CLAWBLOX_CLAUDE_RUNTIME_DIR", &dir)
+                .env("CLAWBLOX_CLAUDE_LOG_DIR", &dir)
+                // 2 requests per 2s, spread evenly: one request per second.
+                .env("CLAWBLOX_CLAUDE_RATE_LIMITS", "2/2s")
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(
+                    format!(
+                        "{{\"transcript_path\":{:?}}}",
+                        transcript.display().to_string()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            assert!(child.wait().unwrap().success());
+            started.elapsed().as_secs_f64()
+        };
+
+        assert!(run("msg_1") < 0.8, "first request should not wait");
+        // A second tool call from the same model response is not paced again.
+        assert!(run("msg_1") < 0.8, "same response should not wait");
+        let waited = run("msg_2");
+        assert!(
+            waited >= 0.8,
+            "next response should wait ~1s, waited {waited}"
+        );
+
+        let log = std::fs::read_to_string(dir.join("pace.log")).unwrap();
+        assert_eq!(log.lines().count(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claude_pace_hook_applies_live_budget_changes_mid_wait() {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: node not available");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "clawblox-claude-pace-live-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hook = dir.join("pace.js");
+        write_executable_file(&hook, CLAUDE_PACE_JS).unwrap();
+
+        let spawn = || {
+            std::process::Command::new("node")
+                .arg(&hook)
+                .arg("test")
+                .env("CLAWBLOX_CLAUDE_RUNTIME_DIR", &dir)
+                .env("CLAWBLOX_CLAUDE_LOG_DIR", &dir)
+                // One request per minute at startup.
+                .env("CLAWBLOX_CLAUDE_RATE_LIMITS", "1/min")
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+
+        assert!(spawn().wait().unwrap().success());
+        let started = std::time::Instant::now();
+        let mut waiting = spawn();
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        std::fs::write(dir.join("pace.json"), r#"{"rate_limits":["100/1s"]}"#).unwrap();
+        assert!(waiting.wait().unwrap().success());
+        let waited = started.elapsed().as_secs_f64();
+        assert!(
+            waited < 15.0,
+            "live budget change should end the wait, waited {waited}"
+        );
+
+        let log = std::fs::read_to_string(dir.join("pace.log")).unwrap();
+        assert!(log.contains("test:replanned"), "{log}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn kimi_stop_hook_is_nonblocking_and_signals_each_fire() {
         if std::process::Command::new("python3")

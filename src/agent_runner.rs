@@ -45,6 +45,8 @@ When using the bash tool with timeout, always keep the timeout duration under 30
 
 Prefer observing and acting directly over using scripts.
 
+Think out loud in the world chat (POST /chat): every so often, share what you are doing, noticing, or feeling, especially when something interesting happens. Keep messages short.
+
 Note: There is an automated stop hook. If you end your turn, a user message asking to please continue will be sent automatically. Just continue doing whatever you want to do. Avoid wasting time in an endless response loop with the stop hook.
 
 World base URL: ${WORLD_BASE_URL}
@@ -68,6 +70,92 @@ pub struct AgentRunnerOptions {
     pub system_prompt: Option<PathBuf>,
     pub sandbox: bool,
     pub sandbox_config: SandboxConfig,
+    pub pacing: ClaudePacing,
+}
+
+/// Request budget for a Claude agent's nonstop loop, enforced by its hooks so a
+/// subscription such as Claude Pro lasts instead of hitting its usage limit.
+#[derive(Clone, Debug, Default)]
+pub struct ClaudePacing {
+    /// Limits like "250/5h" or "3000/week": at most N model requests per window.
+    pub rate_limits: Vec<String>,
+    /// Minimum seconds between model requests.
+    pub min_interval_seconds: Option<f64>,
+    /// Spend each window's budget as fast as allowed instead of spreading it evenly.
+    pub burst: bool,
+}
+
+impl ClaudePacing {
+    pub fn is_enabled(&self) -> bool {
+        !self.rate_limits.is_empty() || self.min_interval_seconds.is_some_and(|s| s > 0.0)
+    }
+
+    pub fn env(&self) -> Vec<(String, String)> {
+        if !self.is_enabled() {
+            return Vec::new();
+        }
+        let mut env = vec![
+            (
+                "CLAWBLOX_CLAUDE_RATE_LIMITS".to_string(),
+                self.rate_limits.join(","),
+            ),
+            (
+                "CLAWBLOX_CLAUDE_PACE".to_string(),
+                if self.burst { "burst" } else { "even" }.to_string(),
+            ),
+        ];
+        if let Some(seconds) = self.min_interval_seconds {
+            env.push((
+                "CLAWBLOX_CLAUDE_MIN_INTERVAL".to_string(),
+                seconds.to_string(),
+            ));
+        }
+        env
+    }
+
+    /// Seconds between model requests once every window is spread evenly.
+    pub fn even_interval_seconds(&self) -> f64 {
+        let mut interval = self.min_interval_seconds.unwrap_or(0.0);
+        if !self.burst {
+            for limit in &self.rate_limits {
+                if let Ok((count, seconds)) = parse_rate_limit(limit) {
+                    interval = interval.max(seconds / count as f64);
+                }
+            }
+        }
+        interval
+    }
+}
+
+/// Parses a request limit such as "250/5h", "30/min" or "3000/week" into
+/// (requests, window seconds). Mirrors the parser in the Claude pace hook.
+pub fn parse_rate_limit(text: &str) -> Result<(u64, f64), String> {
+    let invalid =
+        || format!("invalid rate limit {text:?}; expected e.g. 250/5h, 30/min or 3000/week");
+    let (count, period) = text.trim().split_once('/').ok_or_else(invalid)?;
+    let count: u64 = count.trim().parse().map_err(|_| invalid())?;
+    let period = period.trim().to_ascii_lowercase();
+    let unit_start = period
+        .find(|c: char| c.is_ascii_alphabetic())
+        .ok_or_else(invalid)?;
+    let (multiplier, unit) = period.split_at(unit_start);
+    let multiplier: f64 = if multiplier.is_empty() {
+        1.0
+    } else {
+        multiplier.parse().map_err(|_| invalid())?
+    };
+    let unit_seconds = match unit {
+        "s" | "sec" => 1.0,
+        "m" | "min" => 60.0,
+        "h" | "hour" => 3600.0,
+        "d" | "day" => 86400.0,
+        "w" | "week" => 604800.0,
+        _ => return Err(invalid()),
+    };
+    if count == 0 || multiplier <= 0.0 {
+        return Err(invalid());
+    }
+    Ok((count, multiplier * unit_seconds))
 }
 
 #[derive(Clone, Debug)]
@@ -237,7 +325,10 @@ pub fn start_agent_tmux_for_local_world(
                 local_world_url(port, base_path),
             ),
             ("WORLD_AGENT_NAME".to_string(), safe_name),
-        ],
+        ]
+        .into_iter()
+        .chain(options.pacing.env())
+        .collect(),
         extra_args: Vec::new(),
         sandbox: options.sandbox,
         sandbox_config,
@@ -461,6 +552,7 @@ pub fn start_agent(options: AgentStartOptions) -> Result<StartedAgent, String> {
                 idle_grace_seconds: env_u64("CLAUDE_FAILURE_IDLE_GRACE_SECONDS", 180),
                 stall_grace_seconds: env_u64("CLAUDE_FAILURE_STALL_GRACE_SECONDS", 300),
                 restart_backoff_seconds: env_u64("CLAUDE_FAILURE_RESTART_BACKOFF_SECONDS", 5),
+                rate_limit_backoff_seconds: env_u64("CLAUDE_RATE_LIMIT_BACKOFF_SECONDS", 1800),
                 poll_seconds: env_u64("CLAUDE_FAILURE_POLL_SECONDS", 2),
             }) {
                 let _ = append_operation_report(
@@ -1759,6 +1851,37 @@ fn absolutize_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_rate_limits() {
+        assert_eq!(parse_rate_limit("250/5h"), Ok((250, 18000.0)));
+        assert_eq!(parse_rate_limit("30/min"), Ok((30, 60.0)));
+        assert_eq!(parse_rate_limit(" 3000 / week "), Ok((3000, 604800.0)));
+        assert!(parse_rate_limit("0/day").is_err());
+        assert!(parse_rate_limit("10/fortnight").is_err());
+        assert!(parse_rate_limit("ten/day").is_err());
+    }
+
+    #[test]
+    fn claude_pacing_env_and_interval() {
+        assert!(ClaudePacing::default().env().is_empty());
+        let pacing = ClaudePacing {
+            rate_limits: vec!["250/5h".to_string(), "3000/week".to_string()],
+            min_interval_seconds: None,
+            burst: false,
+        };
+        assert!(pacing.env().contains(&(
+            "CLAWBLOX_CLAUDE_RATE_LIMITS".to_string(),
+            "250/5h,3000/week".to_string()
+        )));
+        // The weekly budget is the tighter one: 604800 / 3000 = 201.6s.
+        assert!((pacing.even_interval_seconds() - 201.6).abs() < 1e-6);
+        let burst = ClaudePacing {
+            burst: true,
+            ..pacing
+        };
+        assert_eq!(burst.even_interval_seconds(), 0.0);
+    }
 
     #[test]
     fn shell_quotes_command_specs() {

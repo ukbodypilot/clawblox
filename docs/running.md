@@ -35,6 +35,9 @@ clawblox run <world> --record --record-dir runs/r001/recordings
 clawblox run <world> --resume runs/r001/resume/latest.json
 ```
 
+Runs that start an agent with `--agent` record by default (to `<world>/recordings`
+unless `--record-dir` is set); pass `--no-record` to turn that off.
+
 `--agent` starts a managed agent in the world; see [Agents](/agents)
 for coding agents, sandboxing, and multi-agent runs. `--resume` restores a saved
 world snapshot; see [Save, load, and resume](/save-load-resume) for what a
