@@ -83,6 +83,45 @@ the agent directory, and sets the environment the agent needs. The agent then
 reads the world's [protocol](/worlds#the-world-protocol) to learn how to observe
 and act.
 
+## Running on a Claude subscription
+
+A coding agent left to run nonstop spends a Claude Pro or Max plan's usage
+limit in an hour or two, then stalls until the limit resets. To keep a Claude
+agent playing around the clock instead, give it a request budget:
+
+```bash
+clawblox run <world> --agent claude --plan pro
+```
+
+`--plan pro|max5|max20` sets a budget of model requests per 5-hour window and
+per week, and spreads them evenly so the agent never runs dry. `--plan pro`
+also defaults the model to Sonnet. Anthropic does not publish exact limits, so
+the plan budgets are rough, conservative estimates (Pro: 250 per 5 hours and
+3000 per week, about one request every 3.4 minutes). Tune them with
+`--rate-limit`, which replaces the plan's budget and can be repeated:
+
+```bash
+clawblox run <world> --agent claude --model sonnet \
+  --rate-limit 300/5h --rate-limit 4000/week
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--rate-limit N/PERIOD` | At most `N` model requests per window. Periods: `s`, `min`, `h`, `day`, `week`, with an optional multiplier such as `5h`. |
+| `--min-request-interval SECONDS` | Minimum gap between model requests. |
+| `--burst` | Spend each window as fast as allowed instead of evenly, then wait for it to free up. |
+
+The agent's `PreToolUse` and `Stop` hooks enforce the budget: each one marks a
+finished model response and sleeps until the next request fits. Usage is kept
+in `runtime/pace_state.json`, so restarts keep counting, and every pause is
+logged to `logs/pace.log`. Check real usage with `/status` inside the agent's
+tmux session and adjust. Keep the even interval under about 5 minutes so
+Claude Code's prompt cache stays warm between requests.
+
+If the agent still hits a usage limit, the recovery watchdog waits
+`CLAUDE_RATE_LIMIT_BACKOFF_SECONDS` (default 1800) and restarts it, so the run
+resumes on its own once the limit resets.
+
 ## Sandbox
 
 Pass `--sandbox` (CLI) or `sandbox=True` (Python) to run the coding agent in a

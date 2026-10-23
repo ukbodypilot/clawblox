@@ -42,7 +42,7 @@ use include_dir::{include_dir, Dir};
 use tower_http::services::ServeDir;
 
 use clawblox::{
-    agent_runner::{start_agent_tmux_for_local_world, AgentRunnerOptions},
+    agent_runner::{start_agent_tmux_for_local_world, AgentRunnerOptions, ClaudePacing},
     capture::{CaptureAttach, CaptureManager},
     config::{PhysicsConfig, SpeechConfig, SpeechMode},
     db,
@@ -165,6 +165,32 @@ impl LocalDatastore {
     }
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ClaudePlan {
+    Pro,
+    Max5,
+    Max20,
+}
+
+impl ClaudePlan {
+    /// Rough model-request budgets per 5-hour window and per week. Anthropic
+    /// does not publish exact numbers, so these are conservative estimates for
+    /// Sonnet; tune them with --rate-limit after watching `/status`.
+    fn rate_limits(self) -> Vec<String> {
+        let (window, week) = match self {
+            Self::Pro => (250, 3000),
+            Self::Max5 => (1250, 15000),
+            Self::Max20 => (5000, 60000),
+        };
+        vec![format!("{window}/5h"), format!("{week}/week")]
+    }
+}
+
+fn parse_rate_limit_arg(text: &str) -> Result<String, String> {
+    clawblox::agent_runner::parse_rate_limit(text)?;
+    Ok(text.trim().to_string())
+}
+
 impl CliAgentKind {
     fn as_str(&self) -> &'static str {
         match self {
@@ -243,6 +269,22 @@ enum Commands {
         /// Enable agent sandbox mode
         #[arg(long)]
         sandbox: bool,
+        /// Pace a Claude agent to fit a Claude subscription's usage limits
+        /// (rough request budgets; see docs/agents.md). Pro also defaults the
+        /// model to Sonnet.
+        #[arg(long, value_enum)]
+        plan: Option<ClaudePlan>,
+        /// Claude agent request budget like 250/5h or 3000/week (repeatable;
+        /// replaces the --plan budget)
+        #[arg(long = "rate-limit", value_parser = parse_rate_limit_arg)]
+        rate_limits: Vec<String>,
+        /// Minimum seconds between a Claude agent's model requests
+        #[arg(long)]
+        min_request_interval: Option<f64>,
+        /// Spend each budget window as fast as allowed instead of spreading
+        /// requests evenly across it
+        #[arg(long)]
+        burst: bool,
     },
     /// Replay a recorded session
     Replay {
@@ -362,28 +404,59 @@ fn main() {
             agent_dir,
             system_prompt,
             sandbox,
-        } => run_game(
-            path,
-            port,
-            &base_path,
-            daemon,
-            datastore,
-            record,
-            record_dir.or_else(|| std::env::var_os("WORLD_RECORD_DIR").map(PathBuf::from)),
-            resume,
-            skip_run_command,
-            agent.map(|kind| AgentRunnerOptions {
-                kind: kind.as_str().to_string(),
-                name: agent_name,
-                model,
-                permission_mode,
-                tmux_session,
-                agent_dir,
-                system_prompt,
-                sandbox,
-                sandbox_config: clawblox::config::SandboxConfig::default(),
-            }),
-        ),
+            plan,
+            rate_limits,
+            min_request_interval,
+            burst,
+        } => {
+            let pacing = ClaudePacing {
+                rate_limits: if rate_limits.is_empty() {
+                    plan.map(ClaudePlan::rate_limits).unwrap_or_default()
+                } else {
+                    rate_limits
+                },
+                min_interval_seconds: min_request_interval,
+                burst,
+            };
+            if pacing.is_enabled() && !matches!(agent, Some(CliAgentKind::Claude)) {
+                eprintln!(
+                    "Error: --plan, --rate-limit and --min-request-interval require --agent claude"
+                );
+                std::process::exit(2);
+            }
+            if pacing.is_enabled() {
+                println!(
+                    "Claude pacing: budget [{}], about one model request every {:.0}s",
+                    pacing.rate_limits.join(", "),
+                    pacing.even_interval_seconds()
+                );
+            }
+            let model = model
+                .or_else(|| matches!(plan, Some(ClaudePlan::Pro)).then(|| "sonnet".to_string()));
+            run_game(
+                path,
+                port,
+                &base_path,
+                daemon,
+                datastore,
+                record,
+                record_dir.or_else(|| std::env::var_os("WORLD_RECORD_DIR").map(PathBuf::from)),
+                resume,
+                skip_run_command,
+                agent.map(|kind| AgentRunnerOptions {
+                    kind: kind.as_str().to_string(),
+                    name: agent_name,
+                    model,
+                    permission_mode,
+                    tmux_session,
+                    agent_dir,
+                    system_prompt,
+                    sandbox,
+                    sandbox_config: clawblox::config::SandboxConfig::default(),
+                    pacing,
+                }),
+            )
+        }
         Commands::Replay {
             file,
             speed,
